@@ -27,7 +27,13 @@ def get_bq_client():
 # Load model
 @st.cache_resource
 def load_model():
-    with open('/Users/arvindeashwar/Downloads/doordash_enhanced_model.pkl', 'rb') as f:
+    # Try local path first, then relative path for Streamlit Cloud
+    import os
+    local_path = '/Users/arvindeashwar/Downloads/doordash_enhanced_model.pkl'
+    cloud_path = 'doordash_enhanced_model.pkl'
+
+    model_path = local_path if os.path.exists(local_path) else cloud_path
+    with open(model_path, 'rb') as f:
         return pickle.load(f)
 
 # Get feature importance
@@ -370,6 +376,206 @@ def main():
 
                 **Change:** {int(total_change)} ({total_pct_change:+.0f}%)
                 """)
+
+            st.markdown("---")
+
+            # NEW SECTION 2.5: MODEL'S TOP 5 FACTORS - EXPLICIT TRACKING
+            st.header("🎯 Section 2.5: Model's Top 5 Win Rate Drivers - Did They Change?")
+
+            st.markdown("""
+            The model identified **5 critical factors** that predict win rates. Let's see if these changed between Sep and Oct:
+            """)
+
+            # Query detailed data for top 5 factors
+            detailed_query = f"""
+            WITH temporal_patterns AS (
+                SELECT
+                    order_month,
+                    order_dow as day_of_week,
+                    order_hour as hour,
+                    COUNT(*) as disputes,
+                    AVG(CASE WHEN is_won = 1 THEN 1.0 ELSE 0.0 END) * 100 as win_rate
+                FROM `merchant_portal_export.dispute_training_post_policy`
+                WHERE LOWER(slug) LIKE '{chain_slug}%'
+                  AND order_year = {year}
+                  AND order_month IN ({sep_month}, {oct_month})
+                GROUP BY 1, 2, 3
+                HAVING disputes > 5
+            ),
+            error_categories AS (
+                SELECT
+                    order_month,
+                    error_type,
+                    COUNT(*) as disputes,
+                    AVG(CASE WHEN is_won = 1 THEN 1.0 ELSE 0.0 END) * 100 as win_rate,
+                    COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (PARTITION BY order_month) as pct_of_total
+                FROM `merchant_portal_export.dispute_training_post_policy`
+                WHERE LOWER(slug) LIKE '{chain_slug}%'
+                  AND order_year = {year}
+                  AND order_month IN ({sep_month}, {oct_month})
+                GROUP BY 1, 2
+            ),
+            order_types AS (
+                SELECT
+                    order_month,
+                    CASE
+                        WHEN UPPER(error_type) LIKE '%CANCEL%' THEN 'Cancelled'
+                        WHEN UPPER(error_type) LIKE '%INACCURATE%' OR UPPER(error_type) LIKE '%MISSING%' OR UPPER(error_type) LIKE '%WRONG%' THEN 'Inaccurate'
+                        ELSE 'Other'
+                    END as order_type,
+                    COUNT(*) as disputes,
+                    AVG(CASE WHEN is_won = 1 THEN 1.0 ELSE 0.0 END) * 100 as win_rate
+                FROM `merchant_portal_export.dispute_training_post_policy`
+                WHERE LOWER(slug) LIKE '{chain_slug}%'
+                  AND order_year = {year}
+                  AND order_month IN ({sep_month}, {oct_month})
+                GROUP BY 1, 2
+            )
+            SELECT 'temporal' as data_type, CAST(order_month AS STRING) as month, CAST(day_of_week AS STRING) as category,
+                   CAST(hour AS STRING) as subcategory, disputes, win_rate FROM temporal_patterns
+            UNION ALL
+            SELECT 'error_category', CAST(order_month AS STRING), error_type, CAST(pct_of_total AS STRING), disputes, win_rate FROM error_categories
+            UNION ALL
+            SELECT 'order_type', CAST(order_month AS STRING), order_type, '', disputes, win_rate FROM order_types
+            """
+
+            try:
+                detailed_df = get_bq_client().query(detailed_query).to_dataframe()
+
+                # Factor #1: Temporal Patterns (33% importance)
+                st.subheader("1️⃣ Factor #1: Temporal Patterns (33% model weight)")
+                st.markdown("**Day/Hour when disputes occur** - The #1 driver of win rates")
+
+                temporal_data = detailed_df[detailed_df['data_type'] == 'temporal'].copy()
+
+                if len(temporal_data) > 0:
+                    # Calculate peak hours
+                    sep_temporal = temporal_data[temporal_data['month'] == str(sep_month)]
+                    oct_temporal = temporal_data[temporal_data['month'] == str(oct_month)]
+
+                    if len(sep_temporal) > 0 and len(oct_temporal) > 0:
+                        sep_peak_hour = sep_temporal.groupby('subcategory')['disputes'].sum().idxmax()
+                        oct_peak_hour = oct_temporal.groupby('subcategory')['disputes'].sum().idxmax()
+
+                        sep_peak_wr = sep_temporal[sep_temporal['subcategory'] == sep_peak_hour]['win_rate'].mean()
+                        oct_peak_wr = oct_temporal[oct_temporal['subcategory'] == oct_peak_hour]['win_rate'].mean()
+
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric(
+                                f"Sep Peak Hour ({sep_peak_hour}:00)",
+                                f"{sep_peak_wr:.1f}% WR",
+                                f"{sep_temporal[sep_temporal['subcategory'] == sep_peak_hour]['disputes'].sum():.0f} disputes"
+                            )
+                        with col2:
+                            wr_change_temporal = oct_peak_wr - sep_peak_wr
+                            st.metric(
+                                f"Oct Peak Hour ({oct_peak_hour}:00)",
+                                f"{oct_peak_wr:.1f}% WR",
+                                f"{wr_change_temporal:+.1f}pp",
+                                delta_color="normal"
+                            )
+
+                        if sep_peak_hour != oct_peak_hour:
+                            st.warning(f"⚠️ **Peak hour shifted** from {sep_peak_hour}:00 to {oct_peak_hour}:00 - this changes win rate dynamics!")
+
+                        if abs(wr_change_temporal) > 5:
+                            st.error(f"🚨 **CRITICAL:** Peak hour WR changed by {wr_change_temporal:+.1f}pp - This is the #1 model driver (33% weight)!")
+                else:
+                    st.info("⚠️ Insufficient temporal data for analysis")
+
+                st.markdown("---")
+
+                # Factor #2: Error Category Baseline (20% importance)
+                st.subheader("2️⃣ Factor #2: Error Category Mix (20% model weight)")
+                st.markdown("**Which error types** - Some categories are inherently harder to win")
+
+                error_cat_data = detailed_df[detailed_df['data_type'] == 'error_category'].copy()
+
+                if len(error_cat_data) > 0:
+                    sep_errors = error_cat_data[error_cat_data['month'] == str(sep_month)].nlargest(5, 'disputes')
+                    oct_errors = error_cat_data[error_cat_data['month'] == str(oct_month)].nlargest(5, 'disputes')
+
+                    # Show top error types side by side
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        st.markdown(f"**Sep Top Errors:**")
+                        for idx, row in sep_errors.iterrows():
+                            pct = float(row['subcategory'])
+                            st.markdown(f"- **{row['category']}**: {pct:.1f}% of disputes, {row['win_rate']:.1f}% WR")
+
+                    with col2:
+                        st.markdown(f"**Oct Top Errors:**")
+                        for idx, row in oct_errors.iterrows():
+                            pct = float(row['subcategory'])
+                            st.markdown(f"- **{row['category']}**: {pct:.1f}% of disputes, {row['win_rate']:.1f}% WR")
+
+                    # Check for mix shifts
+                    sep_top_error = sep_errors.iloc[0]['category']
+                    oct_top_error = oct_errors.iloc[0]['category']
+
+                    if sep_top_error != oct_top_error:
+                        st.warning(f"⚠️ **Error mix shifted**: Top error changed from '{sep_top_error}' to '{oct_top_error}'")
+                        st.markdown("💡 **Impact:** Different error types have different baseline win rates - this shift affects overall WR")
+                else:
+                    st.info("⚠️ Insufficient error category data")
+
+                st.markdown("---")
+
+                # Factor #4: Order Type (9% importance)
+                st.subheader("4️⃣ Factor #4: Order Type - Cancelled vs Inaccurate (9% model weight)")
+                st.markdown("**Order type split** - Cancelled orders have different win rates than inaccurate orders")
+
+                order_type_data = detailed_df[detailed_df['data_type'] == 'order_type'].copy()
+
+                if len(order_type_data) > 0:
+                    sep_types = order_type_data[order_type_data['month'] == str(sep_month)]
+                    oct_types = order_type_data[order_type_data['month'] == str(oct_month)]
+
+                    # Create comparison chart
+                    fig_types = go.Figure()
+
+                    for order_type in ['Cancelled', 'Inaccurate', 'Other']:
+                        sep_wr = sep_types[sep_types['category'] == order_type]['win_rate'].values
+                        oct_wr = oct_types[oct_types['category'] == order_type]['win_rate'].values
+
+                        if len(sep_wr) > 0 and len(oct_wr) > 0:
+                            fig_types.add_trace(go.Bar(
+                                name=f'{order_type} - Sep',
+                                x=[f'{order_type} Sep'],
+                                y=[sep_wr[0]],
+                                marker_color='lightblue'
+                            ))
+                            fig_types.add_trace(go.Bar(
+                                name=f'{order_type} - Oct',
+                                x=[f'{order_type} Oct'],
+                                y=[oct_wr[0]],
+                                marker_color='darkblue'
+                            ))
+
+                    fig_types.update_layout(
+                        title="Win Rate by Order Type: Sep vs Oct",
+                        yaxis_title="Win Rate (%)",
+                        barmode='group',
+                        height=400
+                    )
+
+                    st.plotly_chart(fig_types, use_container_width=True)
+
+                    # Calculate mix shift
+                    sep_cancelled_pct = sep_types[sep_types['category'] == 'Cancelled']['disputes'].sum() / sep_types['disputes'].sum() * 100
+                    oct_cancelled_pct = oct_types[oct_types['category'] == 'Cancelled']['disputes'].sum() / oct_types['disputes'].sum() * 100
+                    cancelled_shift = oct_cancelled_pct - sep_cancelled_pct
+
+                    if abs(cancelled_shift) > 5:
+                        st.warning(f"⚠️ **Mix shift detected**: Cancelled orders went from {sep_cancelled_pct:.1f}% to {oct_cancelled_pct:.1f}% of total ({cancelled_shift:+.1f}pp)")
+                else:
+                    st.info("⚠️ Insufficient order type data")
+
+            except Exception as e:
+                st.error(f"Error fetching detailed factor data: {str(e)}")
+                st.info("Continuing with aggregate analysis...")
 
             st.markdown("---")
 
